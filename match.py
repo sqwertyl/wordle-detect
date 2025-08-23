@@ -15,6 +15,8 @@ class Detection:
     width_norm: float
     height_norm: float
     confidence: float
+    user_id: str
+    user_id_conf: float
 
     def to_bbox_px(self, image_width: int, image_height: int) -> Tuple[int, int, int, int]:
         x_center = self.x_center_norm * image_width
@@ -51,6 +53,12 @@ def load_yolo_labels(labels_path: str) -> List[Detection]:
             width_norm = float(parts[3])
             height_norm = float(parts[4])
             confidence = float(parts[5]) if len(parts) > 5 else 1.0
+            if len(parts) > 6 and parts[6] == "#":
+                user_id = parts[7].split("=")[1]
+                user_id_conf = float(parts[8].split("=")[1])
+            else:
+                user_id = None
+                user_id_conf = 0.0
             detections.append(
                 Detection(
                     class_id=class_id,
@@ -59,6 +67,8 @@ def load_yolo_labels(labels_path: str) -> List[Detection]:
                     width_norm=width_norm,
                     height_norm=height_norm,
                     confidence=confidence,
+                    user_id=user_id,
+                    user_id_conf=user_id_conf,
                 )
             )
     return detections
