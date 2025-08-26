@@ -1,27 +1,20 @@
-from PIL import Image
-import numpy as np
-import colorsys
 import argparse
-from PIL import ImageDraw
-from PIL import Image
-import numpy as np
 import colorsys
+import re
+from typing import Optional, Tuple
+
 import cv2
-
-from PIL import Image
 import numpy as np
-import colorsys
-from typing import Tuple, Optional
+from PIL import Image, ImageDraw
+import pytesseract
 
-from PIL import Image
-import numpy as np
-import colorsys
 
-def extract_wordle_grid_with_empty(image: np.ndarray | Image.Image,
-                                   bbox_px: Optional[Tuple[int, int, int, int]] = None,
-                                   rows=6, cols=5,
-                                   empty_token='E', gray_token='B',
-                                   pad: float = 0.06):
+
+def extract_wordle_grid(image: np.ndarray | Image.Image,
+                        bbox_px: Optional[Tuple[int, int, int, int]] = None,
+                        rows=6, cols=5,
+                        empty_token='E', gray_token='B',
+                        pad: float = 0.06):
     """
     Return a rows×cols grid of {'G','Y','B','E'} from a Wordle screenshot.
 
@@ -52,10 +45,7 @@ def extract_wordle_grid_with_empty(image: np.ndarray | Image.Image,
         bottom = min(rgb.shape[0] - 1, y2 + py)
         rgb = rgb[top:bottom+1, left:right+1]
 
-    # show the cropped image
-    cv2.imshow("cropped", rgb)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
+    # (no GUI side-effects)
 
     # ---------- helpers ----------
     def _rgb_to_hsv_array(a):
@@ -197,7 +187,7 @@ def extract_wordle_grid_with_empty(image: np.ndarray | Image.Image,
         grid.append(row)
     return grid
 
-def overlay_grid(image_path, grid):
+def render_grid_overlay(image_path, grid):
     im = Image.open(image_path)
     draw = ImageDraw.Draw(im)
     for i, row in enumerate(grid):
@@ -205,7 +195,7 @@ def overlay_grid(image_path, grid):
             draw.text((j*im.width/5, i*im.height/6), cell, fill="red")
     im.show()
 
-def check_num_guesses_and_solved(grid):
+def summarize_grid(grid):
     num_guesses = 0
     solved = False
     for row in grid:
@@ -216,16 +206,170 @@ def check_num_guesses_and_solved(grid):
             break
     return num_guesses, solved
 
+def extract_wordle_number(image: np.ndarray | Image.Image,
+                          top_band_ratio: float = 0.18,
+                          center_width_ratio: float = 0.62,
+                          debug: bool = False) -> Optional[int]:
+    """
+    Extract the "Wordle No. ####" number from the top banner using Tesseract.
+
+    Heuristics:
+    - Crop the top band of the image (default ~18% height) and center it
+      horizontally to avoid avatars/columns.
+    - Apply several robust preprocessing pipelines and OCR settings.
+    - Parse with regex, correct common OCR confusions, and majority-vote
+      across passes.
+
+    Returns an integer Wordle number if detected, otherwise None.
+    """
+
+    # ---------- normalize to RGB uint8 ----------
+    if isinstance(image, Image.Image):
+        rgb = np.asarray(image.convert("RGB"))
+    else:
+        arr = image
+        if arr.ndim == 3 and arr.shape[2] == 3:
+            rgb = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+        else:
+            if arr.ndim == 2:
+                rgb = cv2.cvtColor(arr, cv2.COLOR_GRAY2RGB)
+            else:
+                rgb = arr.astype(np.uint8)
+
+    H, W = rgb.shape[:2]
+    if H == 0 or W == 0:
+        return None
+
+    # ---------- crop top banner (centered horizontally) ----------
+    top_h = max(10, int(round(H * top_band_ratio)))
+    mid_x = W // 2
+    half_w = int(round((W * center_width_ratio) / 2))
+    x0 = max(0, mid_x - half_w)
+    x1 = min(W, mid_x + half_w)
+    banner = rgb[0:top_h, x0:x1]
+
+    # If banner is too dark/empty, slightly expand
+    if banner.mean() < 10 and top_h < int(0.30 * H):
+        top_h2 = int(0.30 * H)
+        banner = rgb[0:top_h2, x0:x1]
+
+    # ---------- build preprocess variants ----------
+    def to_gray(a: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(a, cv2.COLOR_RGB2GRAY)
+
+    def clahe_enhance(g: np.ndarray) -> np.ndarray:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return clahe.apply(g)
+
+    def invert_if_dark_bg(g: np.ndarray) -> np.ndarray:
+        # If background is dark and text bright, invert to black-text on white
+        return cv2.bitwise_not(g) if g.mean() < 128 else g
+
+    def otsu(g: np.ndarray) -> np.ndarray:
+        _, th = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        return th
+
+    def morph_close(g: np.ndarray) -> np.ndarray:
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        return cv2.morphologyEx(g, cv2.MORPH_CLOSE, k, iterations=1)
+
+    def upscale(a: np.ndarray, scale: float) -> np.ndarray:
+        return cv2.resize(a, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+    gray = to_gray(banner)
+    variants: list[np.ndarray] = []
+    # Variant A: CLAHE -> invert -> OTSU
+    va = otsu(invert_if_dark_bg(clahe_enhance(gray)))
+    variants.append(va)
+    # Variant B: plain invert + OTSU
+    vb = otsu(invert_if_dark_bg(gray))
+    variants.append(vb)
+    # Variant C: CLAHE only
+    vc = clahe_enhance(gray)
+    variants.append(vc)
+    # Variant D: OTSU then close
+    vd = morph_close(va)
+    variants.append(vd)
+
+    # Prepare upscaled versions to aid OCR on small text
+    base_variants = list(variants)
+    for v in base_variants:
+        variants.append(upscale(v, 1.6))
+        variants.append(upscale(v, 2.2))
+
+    # ---------- OCR passes ----------
+    psm_options = [7, 6, 13]  # single line, block, raw line
+    configs = [
+        lambda psm: f"-l eng --oem 3 --psm {psm} "+
+                    "-c tessedit_char_whitelist=0123456789WordleNo.# ",
+        lambda psm: f"-l eng --oem 3 --psm {psm}",
+    ]
+
+    # Regex patterns capturing the number
+    patterns = [
+        re.compile(r"(?i)wordle\s*(?:no\.?|#)?\s*(\d{1,5})"),
+        re.compile(r"(?i)(?:no\.?|#)\s*(\d{1,5})"),
+        re.compile(r"(\d{3,5})"),
+    ]
+
+    def normalize_ocr_text(t: str) -> str:
+        # Common OCR confusions: O→0, l→1, I→1, S→5, B→8
+        t = t.replace("O", "0").replace("o", "0")
+        t = t.replace("l", "1").replace("I", "1")
+        t = t.replace("S", "5")
+        return t
+
+    candidates: list[int] = []
+    texts: list[str] = []
+    for img_variant in variants:
+        for psm in psm_options:
+            for cfg_fn in configs:
+                cfg = cfg_fn(psm)
+                try:
+                    txt = pytesseract.image_to_string(img_variant, config=cfg)
+                except Exception:
+                    continue
+                if not txt:
+                    continue
+                txt_norm = normalize_ocr_text(txt)
+                texts.append(txt_norm)
+                for pat in patterns:
+                    m = pat.search(txt_norm)
+                    if m:
+                        num_str = m.group(1)
+                        try:
+                            num = int(num_str)
+                        except ValueError:
+                            continue
+                        # Plausibility filter: Wordle numbers are 1..10000 (generous)
+                        if 1 <= num <= 10000:
+                            candidates.append(num)
+                        break
+
+    if debug:
+        # Print last few OCR texts for troubleshooting during development
+        print("OCR texts (sample):", texts[-5:])
+
+    if not candidates:
+        return None
+
+    # Majority vote by frequency; tiebreaker: highest number of digits then min value
+    freq = {}
+    for c in candidates:
+        freq[c] = freq.get(c, 0) + 1
+    best = sorted(freq.items(), key=lambda kv: (-kv[1], -len(str(kv[0])), kv[0]))[0][0]
+    return int(best)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", type=str, required=True)
     args = parser.parse_args()
 
     img = cv2.imread(args.image)
-    grid = extract_wordle_grid_with_empty(img)
-    overlay_grid(args.image, grid)
+    grid = extract_wordle_grid(img)
+    render_grid_overlay(args.image, grid)
 
-    num_guesses, solved = check_num_guesses_and_solved(grid)
+    num_guesses, solved = summarize_grid(grid)
 
     print(f"num_guesses: {num_guesses}")
     print(f"solved: {solved}")

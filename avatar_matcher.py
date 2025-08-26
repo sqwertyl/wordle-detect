@@ -112,8 +112,9 @@ def build_embeddings_for_image(
 
 
 def build_index(
-    db_dir: Path,
+    in_dir: Path,
     out_dir: Path,
+    manifest_path: Path = "manifest.json",
     model_name: str = "ViT-B-32",
     pretrained: str = "laion2b_s34b_b79k",
     multi_scales: List[float] = [0.85, 0.92, 1.0],
@@ -130,13 +131,14 @@ def build_index(
 
     # Collect image paths
     exts = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
-    paths = [p for p in sorted(db_dir.rglob("*")) if p.suffix.lower() in exts]
+    paths = [p for p in sorted(in_dir.rglob("*")) if p.suffix.lower() in exts]
     if not paths:
-        raise FileNotFoundError(f"No images found under: {db_dir}")
+        raise FileNotFoundError(f"No images found under: {in_dir}")
 
     print(f"Found {len(paths)} images. Computing embeddings...")
     vecs = []
     meta = []  # store mapping from index row -> file path
+    manifest = json.load(open(in_dir / manifest_path))
     for i, p in enumerate(paths, 1):
         try:
             emb = build_embeddings_for_image(model, preprocess, device, p, input_size, multi_scales)
@@ -144,7 +146,12 @@ def build_index(
             print(f"[WARN] Skipping {p} due to error: {e}")
             continue
         vecs.append(emb)
-        meta.append({"path": str(p)})
+        if manifest is None:
+            print(f"[WARN] No manifest found at {in_dir / manifest_path}, using path only")
+            meta.append({"path": str(p)})
+        else:
+            info = manifest.get(str(p), {})
+            meta.append({"path": str(p), "user_id": info.get("user_id"), "username": info.get("username")})
         if i % 100 == 0:
             print(f"  Processed {i}/{len(paths)}")
 
@@ -201,7 +208,7 @@ def search_index(
     D = D[0].tolist()
     I = I[0].tolist()
 
-    results = [(float(D[i]), items[I[i]]["path"]) for i in range(len(I))]
+    results = [(float(D[i]), items[I[i]]["path"], items[I[i]]["user_id"], items[I[i]]["username"]) for i in range(len(I))]
     return results
 
 
@@ -279,6 +286,7 @@ def annotate_labels_with_matches(
     W, H = img.width, img.height
 
     parsed = _parse_yolo_labels(labels_path)
+    print(f"Loaded {len(parsed)} detections from {labels_path}")
     updated_lines = []
     for raw_line, det in parsed:
         if det is None:
@@ -289,6 +297,7 @@ def annotate_labels_with_matches(
             updated_lines.append(raw_line.rstrip("\n"))
             continue
 
+        print(f"Processing detection: {det}")
         x1, y1, x2, y2 = _bbox_norm_to_pixels(xc, yc, w, h, W, H)
         crop = img.crop((x1, y1, x2, y2))
         crop = to_square(crop).resize((224, 224), Image.BICUBIC)
@@ -305,8 +314,14 @@ def annotate_labels_with_matches(
             base_tokens = raw_line.strip().split()[:6]
         else:
             base_tokens = raw_line.strip().split()[:5]
-        annotated = " ".join(base_tokens) + f"  # match={top_path} conf={top_score:.6f}"
+        # Derive a stable user identifier from meta, fallback to filename stem
+        user_id = items[top_i]["user_id"] or Path(top_path).stem
+        username = items[top_i]["username"] or Path(top_path).stem
+        # Emit a single JSON object after '#', so values with spaces are preserved
+        ann_obj = {"user_id": str(user_id), "username": username, "conf": round(top_score, 6)}
+        annotated = " ".join(base_tokens) + "  # " + json.dumps(ann_obj, ensure_ascii=False)
         updated_lines.append(annotated)
+        print(f"  .  Found match for {user_id} ({username}) with score {top_score:.6f}")
 
     with open(labels_path, "w", encoding="utf-8") as f:
         for line in updated_lines:
@@ -317,8 +332,9 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_build = sub.add_parser("build-index", help="Build FAISS index from a folder of original images")
-    p_build.add_argument("--db-dir", type=Path, required=True, help="Folder containing original avatar images")
+    p_build.add_argument("--in-dir", type=Path, required=True, help="Folder containing original avatar images")
     p_build.add_argument("--out-dir", type=Path, required=True, help="Output folder for index files")
+    p_build.add_argument("--manifest", type=Path, default="manifest.json", help="Manifest file for user info")
     p_build.add_argument("--model", type=str, default="ViT-B-32", help="OpenCLIP model name (e.g., ViT-B-32, ViT-L-14)")
     p_build.add_argument("--pretrained", type=str, default="laion2b_s34b_b79k", help="OpenCLIP pretrained tag")
     p_build.add_argument("--multi-scales", type=str, default="0.85,0.92,1.0",
@@ -345,8 +361,9 @@ def main():
     if args.cmd == "build-index":
         multi_scales = [float(x) for x in args.multi_scales.split(",") if x.strip()]
         build_index(
-            db_dir=args.db_dir,
+            in_dir=args.in_dir,
             out_dir=args.out_dir,
+            manifest_path=args.manifest,
             model_name=args.model,
             pretrained=args.pretrained,
             multi_scales=multi_scales,
@@ -360,8 +377,8 @@ def main():
             pretrained=args.pretrained or "",
         )
         # Print JSON lines for easy parsing
-        for score, path in results:
-            print(json.dumps({"score": score, "path": path}, ensure_ascii=False))
+        for score, path, user_id, username in results:
+            print(json.dumps({"score": score, "path": path, "user_id": user_id, "username": username}, ensure_ascii=False))
     elif args.cmd == "search-labels":
         annotate_labels_with_matches(
             index_dir=args.index_dir,

@@ -1,4 +1,5 @@
 import os
+import json
 import sys
 from dataclasses import dataclass
 from typing import List, Tuple
@@ -16,6 +17,7 @@ class Detection:
     height_norm: float
     confidence: float
     user_id: str
+    username: str
     user_id_conf: float
 
     def to_bbox_px(self, image_width: int, image_height: int) -> Tuple[int, int, int, int]:
@@ -53,12 +55,47 @@ def load_yolo_labels(labels_path: str) -> List[Detection]:
             width_norm = float(parts[3])
             height_norm = float(parts[4])
             confidence = float(parts[5]) if len(parts) > 5 else 1.0
-            if len(parts) > 6 and parts[6] == "#":
-                user_id = parts[7].split("=")[1]
-                user_id_conf = float(parts[8].split("=")[1])
-            else:
-                user_id = None
-                user_id_conf = 0.0
+            # Parse optional annotation after a '#'. Prefer JSON; fallback to key=value tokens.
+            user_id = None
+            username = None
+            user_id_conf = 0.0
+            if "#" in line:
+                try:
+                    after_hash = line.split("#", 1)[1].strip()
+                    # Try JSON first
+                    if after_hash.startswith("{"):
+                        try:
+                            obj = json.loads(after_hash)
+                            user_id = obj.get("user_id")
+                            username = obj.get("username")
+                            c = obj.get("conf")
+                            if c is not None:
+                                user_id_conf = float(c)
+                        except Exception:
+                            user_id = None
+                            username = None
+                            user_id_conf = 0.0
+                    else:
+                        # Fallback legacy: space-separated key=value tokens
+                        kv_tokens = after_hash.split()
+                        kv = {}
+                        for tok in kv_tokens:
+                            if "=" in tok:
+                                k, v = tok.split("=", 1)
+                                kv[k] = v
+                        if "user_id" in kv:
+                            user_id = kv.get("user_id")
+                        if "username" in kv:
+                            username = kv.get("username")
+                        if "conf" in kv:
+                            try:
+                                user_id_conf = float(kv.get("conf"))
+                            except Exception:
+                                user_id_conf = 0.0
+                except Exception:
+                    user_id = None
+                    username = None
+                    user_id_conf = 0.0
             detections.append(
                 Detection(
                     class_id=class_id,
@@ -68,6 +105,7 @@ def load_yolo_labels(labels_path: str) -> List[Detection]:
                     height_norm=height_norm,
                     confidence=confidence,
                     user_id=user_id,
+                    username=username,
                     user_id_conf=user_id_conf,
                 )
             )
