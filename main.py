@@ -9,7 +9,7 @@ from typing import List, Tuple
 import cv2
 from PIL import Image
 
-from avatar_matcher import annotate_labels_with_matches
+from avatar import find_avatar_matches
 from match import Detection, load_yolo_labels, match_avatars_to_guesses
 from wordle_extract import extract_wordle_grid, extract_wordle_number, summarize_grid
 
@@ -74,7 +74,7 @@ def main():
     args = parser.parse_args()
     
     # add match to labels
-    annotate_labels_with_matches(
+    find_avatar_matches(
         index_dir=args.index_dir,
         image_path=args.image,
         labels_path=args.labels,

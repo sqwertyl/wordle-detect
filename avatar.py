@@ -258,7 +258,7 @@ def _bbox_norm_to_pixels(xc, yc, w, h, W, H):
 
 
 @torch.no_grad()
-def annotate_labels_with_matches(
+def find_avatar_matches(
     index_dir: Path,
     image_path: Path,
     labels_path: Path,
@@ -380,7 +380,7 @@ def main():
         for score, path, user_id, username in results:
             print(json.dumps({"score": score, "path": path, "user_id": user_id, "username": username}, ensure_ascii=False))
     elif args.cmd == "search-labels":
-        annotate_labels_with_matches(
+        find_avatar_matches(
             index_dir=args.index_dir,
             image_path=args.image,
             labels_path=args.labels,
